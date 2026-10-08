@@ -1,12 +1,14 @@
 {
   "name": "alw-webchat",
   "version": "1.0.0",
-  "description": "aLw WebChat",
+  "description": "aLw WebChat + DALnet IRC Bot",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "ws": "^8.18.0",
+    "irc-upd": "^0.1.0"
   }
 }
