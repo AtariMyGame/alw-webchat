@@ -1,4 +1,3 @@
-```js
 "use strict";
 
 const irc = require("irc");
@@ -2301,4 +2300,3 @@ console.log(
   CONFIG.server,
   CONFIG.channels.join(", ")
 );
-```
