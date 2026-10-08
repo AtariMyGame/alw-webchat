@@ -16,7 +16,7 @@ aLw IRC BOT + WEBCHAT
 */
 
 const BOT_NICK = "aLwSc";
-const BOT_USER = "aLw
+const BOT_USER = "aLw";
 const BOT_REALNAME = "aLw WebChat IRC Bot";
 
 const IRC_HOST = "irc.dal.net";
