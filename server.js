@@ -1,53 +1,46 @@
 const express = require("express");
 const path = require("path");
+const http = require("http");
 const net = require("net");
 const fs = require("fs");
-const http = require("http");
 const { WebSocketServer } = require("ws");
 
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
 
 const PORT = process.env.PORT || 6187;
-
-/*
-============================================================
-aLw IRC BOT + WEBCHAT
-============================================================
-*/
-
-const BOT_NICK = "aLwSc";
-const BOT_USER = "aLw";
-const BOT_REALNAME = "aLw WebChat IRC Bot";
 
 const IRC_HOST = "irc.dal.net";
 const IRC_PORT = 6667;
 
+const BOT_NICK = "aLwsc";
+const BOT_USER = "aLwsc";
+const BOT_REALNAME = "aLwsc WebChat IRC Bot";
 const OWNER = "F4R1S";
 
-const CHANNEL_DB = path.join(__dirname, "channels.json");
+const CHANNEL_FILE = path.join(__dirname, "channels.json");
 
-let ircSocket = null;
-let ircBuffer = "";
-let ircConnected = false;
-let ircRegistered = false;
-let reconnectTimer = null;
-let reconnectDelay = 5000;
+app.use(express.static(path.join(__dirname, "public")));
+
+app.get("/", (req, res) => {
+    res.sendFile(path.join(__dirname, "public", "index.html"));
+});
+
+/* ============================================================
+   CHANNEL DATABASE
+   ============================================================ */
 
 let channels = [];
 
-/*
-============================================================
-CHANNEL DATABASE
-============================================================
-*/
-
 function loadChannels() {
     try {
-        if (fs.existsSync(CHANNEL_DB)) {
-            const data = JSON.parse(fs.readFileSync(CHANNEL_DB, "utf8"));
+        if (fs.existsSync(CHANNEL_FILE)) {
+            const data = fs.readFileSync(CHANNEL_FILE, "utf8");
+            channels = JSON.parse(data);
 
-            if (Array.isArray(data)) {
-                channels = data;
+            if (!Array.isArray(channels)) {
+                channels = [];
             }
         }
     } catch (err) {
@@ -59,7 +52,7 @@ function loadChannels() {
 function saveChannels() {
     try {
         fs.writeFileSync(
-            CHANNEL_DB,
+            CHANNEL_FILE,
             JSON.stringify(channels, null, 2)
         );
     } catch (err) {
@@ -69,1249 +62,721 @@ function saveChannels() {
 
 loadChannels();
 
-/*
-============================================================
-WEBCHAT
-============================================================
-*/
+/* ============================================================
+   IRC
+   ============================================================ */
 
-app.use(express.static(path.join(__dirname, "public")));
+let ircSocket = null;
+let ircBuffer = "";
+let connected = false;
+let reconnectDelay = 5000;
 
-app.get("/", (req, res) => {
-    res.sendFile(path.join(__dirname, "public", "index.html"));
-});
-
-const server = http.createServer(app);
-
-const wss = new WebSocketServer({
-    server
-});
-
-const webUsers = new Map();
-
-function broadcast(data) {
-    const message = JSON.stringify(data);
-
-    for (const ws of wss.clients) {
-        if (ws.readyState === 1) {
-            try {
-                ws.send(message);
-            } catch (_) {}
-        }
-    }
-}
-
-function webMessage(nick, message) {
-    broadcast({
-        type: "message",
-        nick,
-        message,
-        time: new Date().toLocaleTimeString("id-ID", {
-            hour: "2-digit",
-            minute: "2-digit"
-        })
-    });
-}
-
-wss.on("connection", (ws) => {
-
-    const defaultNick = "WebUser" + Math.floor(Math.random() * 9999);
-
-    webUsers.set(ws, defaultNick);
-
-    ws.send(JSON.stringify({
-        type: "system",
-        message: `Terhubung ke aLw WebChat sebagai ${defaultNick}`
-    }));
-
-    if (ircConnected) {
-        ws.send(JSON.stringify({
-            type: "system",
-            message: "aLw sedang terhubung ke DALnet."
-        }));
-    } else {
-        ws.send(JSON.stringify({
-            type: "system",
-            message: "aLw sedang menghubungkan ke DALnet..."
-        }));
-    }
-
-    ws.on("message", (raw) => {
-
-        let data;
-
-        try {
-            data = JSON.parse(raw.toString());
-        } catch (_) {
-            return;
-        }
-
-        if (!data || typeof data !== "object") {
-            return;
-        }
-
-        /*
-        --------------------------------------------------------
-        NICK WEBCHAT
-        --------------------------------------------------------
-        */
-
-        if (data.type === "nick") {
-
-            let nick = String(data.nick || "").trim();
-
-            if (!nick) {
-                return;
-            }
-
-            nick = nick.replace(/[^A-Za-z0-9_\-\[\]\\`^{}|]/g, "");
-
-            if (!nick) {
-                return;
-            }
-
-            if (nick.length > 16) {
-                nick = nick.substring(0, 16);
-            }
-
-            webUsers.set(ws, nick);
-
-            ws.send(JSON.stringify({
-                type: "system",
-                message: `Nick kamu sekarang ${nick}`
-            }));
-
-            return;
-        }
-
-        /*
-        --------------------------------------------------------
-        CHAT WEB -> IRC
-        --------------------------------------------------------
-        */
-
-        if (data.type === "message") {
-
-            const message = String(data.message || "").trim();
-
-            if (!message) {
-                return;
-            }
-
-            const nick = webUsers.get(ws) || "WebUser";
-
-            /*
-             * Command dari WebChat
-             */
-
-            if (message.startsWith("/")) {
-                handleWebCommand(nick, message, ws);
-                return;
-            }
-
-            /*
-             * Kirim ke channel pertama
-             */
-
-            if (channels.length === 0) {
-
-                ws.send(JSON.stringify({
-                    type: "system",
-                    message: "Bot belum memiliki channel. Owner gunakan +chan #channel."
-                }));
-
-                return;
-            }
-
-            const channel = channels[0];
-
-            sendIRC(`PRIVMSG ${channel} :[Web] <${nick}> ${message}`);
-
-            /*
-             * Tampilkan juga ke WebChat
-             */
-
-            webMessage(nick, message);
-        }
-    });
-
-    ws.on("close", () => {
-        webUsers.delete(ws);
-    });
-});
-
-/*
-============================================================
-IRC SEND
-============================================================
-*/
-
-function sendIRC(line) {
-
-    if (!ircSocket || !ircConnected) {
+function ircSend(line) {
+    if (!ircSocket || !connected) {
         console.log("IRC belum terhubung:", line);
-        return false;
+        return;
     }
 
-    try {
-        ircSocket.write(line + "\r\n");
-        return true;
-    } catch (err) {
-        console.log("IRC write error:", err.message);
-        return false;
-    }
+    console.log("IRC >", line);
+    ircSocket.write(line + "\r\n");
 }
 
-/*
-============================================================
-IRC CONNECTION
-============================================================
-*/
+function joinSavedChannels() {
+    if (channels.length === 0) {
+        console.log("Belum ada channel tersimpan.");
+        return;
+    }
+
+    for (const channel of channels) {
+        ircSend(`JOIN ${channel}`);
+    }
+}
 
 function connectIRC() {
-
-    if (ircSocket) {
-        try {
-            ircSocket.destroy();
-        } catch (_) {}
-    }
-
     console.log(`Menghubungkan ke DALnet ${IRC_HOST}:${IRC_PORT}...`);
 
-    ircSocket = new net.Socket();
-
-    ircSocket.setTimeout(0);
-
-    ircSocket.connect(
-        IRC_PORT,
-        IRC_HOST,
+    ircSocket = net.createConnection(
+        {
+            host: IRC_HOST,
+            port: IRC_PORT
+        },
         () => {
-
             console.log("Terhubung ke DALnet.");
 
-            ircConnected = true;
-            ircRegistered = false;
-            ircBuffer = "";
+            ircSocket.write(`NICK ${BOT_NICK}\r\n`);
+            ircSocket.write(
+                `USER ${BOT_USER} 0 * :${BOT_REALNAME}\r\n`
+            );
+
             reconnectDelay = 5000;
-
-            sendIRC(`NICK ${BOT_NICK}`);
-            sendIRC(`USER ${BOT_USER} 0 * :${BOT_REALNAME}`);
-
-            broadcast({
-                type: "system",
-                message: "aLw terhubung ke DALnet."
-            });
         }
     );
 
+    ircSocket.setEncoding("utf8");
+
     ircSocket.on("data", (data) => {
+        ircBuffer += data;
 
-        ircBuffer += data.toString();
+        const lines = ircBuffer.split("\r\n");
+        ircBuffer = lines.pop();
 
-        let index;
-
-        while ((index = ircBuffer.indexOf("\r\n")) !== -1) {
-
-            const line = ircBuffer.substring(0, index);
-
-            ircBuffer = ircBuffer.substring(index + 2);
-
-            if (line) {
+        for (const line of lines) {
+            if (line.trim()) {
                 handleIRCLine(line);
             }
         }
     });
 
     ircSocket.on("error", (err) => {
-
         console.log("IRC ERROR:", err.message);
-
-        ircConnected = false;
     });
 
     ircSocket.on("close", () => {
+        connected = false;
+        console.log("Koneksi DALnet terputus.");
 
-        console.log("Koneksi IRC terputus.");
-
-        ircConnected = false;
-        ircRegistered = false;
         ircSocket = null;
 
-        broadcast({
-            type: "system",
-            message: "Koneksi DALnet terputus. Mencoba reconnect..."
-        });
+        console.log(
+            `Mencoba reconnect dalam ${reconnectDelay / 1000} detik...`
+        );
 
-        scheduleReconnect();
+        setTimeout(connectIRC, reconnectDelay);
+
+        reconnectDelay = Math.min(
+            reconnectDelay * 2,
+            60000
+        );
     });
 }
 
-/*
-============================================================
-RECONNECT
-============================================================
-*/
-
-function scheduleReconnect() {
-
-    if (reconnectTimer) {
-        return;
-    }
-
-    reconnectTimer = setTimeout(() => {
-
-        reconnectTimer = null;
-
-        connectIRC();
-
-    }, reconnectDelay);
-
-    reconnectDelay = Math.min(
-        reconnectDelay * 2,
-        60000
-    );
-}
-
-/*
-============================================================
-IRC PARSER
-============================================================
-*/
-
 function handleIRCLine(line) {
+    console.log("IRC <", line);
 
-    console.log("[IRC]", line);
-
-    /*
-    PING
-    */
-
-    if (line.startsWith("PING ")) {
-
-        const payload = line.substring(5);
-
-        sendIRC(`PONG ${payload}`);
-
-        return;
-    }
-
-    let prefix = "";
-    let command = "";
-    let params = [];
-
-    let rest = line;
-
-    if (rest.startsWith(":")) {
-
-        const space = rest.indexOf(" ");
-
-        if (space === -1) {
-            return;
+    if (line.startsWith("PING")) {
+        const value = line.substring(5);
+        if (ircSocket) {
+            ircSocket.write(`PONG ${value}\r\n`);
         }
-
-        prefix = rest.substring(1, space);
-
-        rest = rest.substring(space + 1);
-    }
-
-    const colon = rest.indexOf(" :");
-
-    if (colon !== -1) {
-
-        const before = rest.substring(0, colon);
-        const trailing = rest.substring(colon + 2);
-
-        params = before.split(" ").filter(Boolean);
-        params.push(trailing);
-
-    } else {
-
-        params = rest.split(" ").filter(Boolean);
-    }
-
-    command = params.shift();
-
-    if (!command) {
         return;
     }
 
-    /*
-    --------------------------------------------------------
-    REGISTERED
-    --------------------------------------------------------
-    */
+    const match = line.match(
+        /^:([^! ]+)!([^ ]+) PRIVMSG ([^ ]+) :(.+)$/
+    );
 
-    if (command === "001") {
+    if (match) {
+        const nick = match[1];
+        const target = match[3];
+        const message = match[4];
 
-        ircRegistered = true;
+        broadcastWebChat({
+            type: "irc",
+            nick: nick,
+            target: target,
+            message: message
+        });
+
+        handleIRCCommand(nick, target, message);
+    }
+
+    if (/^\S+ 001 /.test(line)) {
+        connected = true;
 
         console.log("Bot berhasil login/register ke DALnet.");
 
-        broadcast({
-            type: "system",
-            message: "aLw berhasil terhubung ke DALnet."
-        });
-
-        joinSavedChannels();
-
-        return;
+        setTimeout(() => {
+            joinSavedChannels();
+        }, 1000);
     }
 
-    /*
-    --------------------------------------------------------
-    NICK
-    --------------------------------------------------------
-    */
-
-    if (command === "433") {
-
-        console.log("Nick aLw sedang digunakan.");
-
-        const newNick =
-            "aLw" +
-            Math.floor(Math.random() * 99);
-
-        sendIRC(`NICK ${newNick}`);
-
-        return;
+    if (/^\S+ 433 /.test(line)) {
+        console.log(
+            `Nick ${BOT_NICK} sedang digunakan di DALnet.`
+        );
     }
 
-    /*
-    --------------------------------------------------------
-    JOIN
-    --------------------------------------------------------
-    */
-
-    if (command === "JOIN") {
-
-        const nick = getNick(prefix);
-        const channel = params[0];
-
-        if (channel) {
-
-            broadcast({
-                type: "join",
-                nick,
-                channel
-            });
-        }
-
-        return;
-    }
-
-    /*
-    --------------------------------------------------------
-    PART / QUIT
-    --------------------------------------------------------
-    */
-
-    if (command === "PART" || command === "QUIT") {
-
-        const nick = getNick(prefix);
-
-        broadcast({
-            type: "part",
-            nick
-        });
-
-        return;
-    }
-
-    /*
-    --------------------------------------------------------
-    PRIVMSG
-    --------------------------------------------------------
-    */
-
-    if (command === "PRIVMSG") {
-
-        const nick = getNick(prefix);
-
-        const target = params[0];
-        const message = params[1] || "";
-
-        if (!target) {
-            return;
-        }
-
-        /*
-        Pesan channel
-        */
-
-        if (target.startsWith("#")) {
-
-            handleIRCMessage(
-                nick,
-                target,
-                message
-            );
-
-            return;
-        }
-
-        /*
-        Private message
-        */
-
-        broadcast({
-            type: "private",
-            nick,
-            message
-        });
-
-        return;
-    }
-
-    /*
-    --------------------------------------------------------
-    NOTICE
-    --------------------------------------------------------
-    */
-
-    if (command === "NOTICE") {
-
-        const nick = getNick(prefix);
-        const message = params[1] || "";
-
-        broadcast({
-            type: "notice",
-            nick,
-            message
-        });
-
-        return;
-    }
-
-    /*
-    --------------------------------------------------------
-    TOPIC
-    --------------------------------------------------------
-    */
-
-    if (command === "332") {
-
-        const channel = params[1];
-        const topic = params[2] || "";
-
-        broadcast({
-            type: "topic",
-            channel,
-            topic
-        });
-
-        return;
-    }
-
-    /*
-    --------------------------------------------------------
-    NAMES
-    --------------------------------------------------------
-    */
-
-    if (command === "353") {
-
-        const channel = params[2];
-        const names = params[3] || "";
-
-        broadcast({
-            type: "names",
-            channel,
-            names
-        });
-
-        return;
-    }
-
-    /*
-    --------------------------------------------------------
-    KICK
-    --------------------------------------------------------
-    */
-
-    if (command === "KICK") {
-
-        const channel = params[0];
-        const nick = params[1];
-        const reason = params[2] || "";
-
-        broadcast({
-            type: "kick",
-            channel,
-            nick,
-            reason
-        });
-
-        return;
-    }
-}
-
-/*
-============================================================
-GET NICK
-============================================================
-*/
-
-function getNick(prefix) {
-
-    if (!prefix) {
-        return "";
-    }
-
-    return prefix.split("!")[0];
-}
-
-/*
-============================================================
-IRC MESSAGE
-============================================================
-*/
-
-function handleIRCMessage(nick, channel, message) {
-
-    webMessage(nick, message);
-
-    /*
-    Command IRC
-    */
-
-    handleBotCommand(
-        nick,
-        channel,
-        message
+    const joinMatch = line.match(
+        /^:([^! ]+)!([^ ]+) JOIN :?(.+)$/
     );
+
+    if (joinMatch) {
+        broadcastWebChat({
+            type: "join",
+            nick: joinMatch[1],
+            channel: joinMatch[3]
+        });
+    }
+
+    const partMatch = line.match(
+        /^:([^! ]+)!([^ ]+) PART ([^ ]+)/
+    );
+
+    if (partMatch) {
+        broadcastWebChat({
+            type: "part",
+            nick: partMatch[1],
+            channel: partMatch[3]
+        });
+    }
+
+    const quitMatch = line.match(
+        /^:([^! ]+)!([^ ]+) QUIT/
+    );
+
+    if (quitMatch) {
+        broadcastWebChat({
+            type: "quit",
+            nick: quitMatch[1]
+        });
+    }
 }
 
-/*
-============================================================
-BOT COMMANDS
-============================================================
-*/
+/* ============================================================
+   IRC COMMANDS
+   ============================================================ */
 
 function isOwner(nick) {
-
     return nick.toLowerCase() === OWNER.toLowerCase();
 }
 
-function botSay(channel, message) {
-
-    sendIRC(
-        `PRIVMSG ${channel} :${message}`
-    );
+function firstChannel() {
+    return channels.length > 0 ? channels[0] : null;
 }
 
-function botNotice(nick, message) {
-
-    sendIRC(
-        `NOTICE ${nick} :${message}`
-    );
+function commandReply(target, text) {
+    ircSend(`PRIVMSG ${target} :${text}`);
 }
 
-function handleBotCommand(nick, channel, message) {
+function handleIRCCommand(nick, target, message) {
 
-    const text = message.trim();
+    const parts = message.trim().split(/\s+/);
+    const command = parts[0].toLowerCase();
+    const args = parts.slice(1);
 
-    /*
-    +chan
-    */
+    /* OWNER COMMANDS */
 
-    if (text.startsWith("+chan ")) {
+    if (command === "+chan") {
 
         if (!isOwner(nick)) {
-            botNotice(nick, "Command ini khusus owner.");
+            commandReply(target, "Perintah ini khusus owner.");
             return;
         }
 
-        const newChannel =
-            text.substring(6).trim();
+        const channel = args[0];
 
-        if (!/^#[A-Za-z0-9_\-\[\]\\`^{}|]+$/.test(newChannel)) {
-
-            botNotice(nick, "Format: +chan #channel");
+        if (!channel || !channel.startsWith("#")) {
+            commandReply(target, "Gunakan: +chan #channel");
             return;
         }
 
-        if (!channels.includes(newChannel)) {
-
-            channels.push(newChannel);
-
-            saveChannels();
-
-            sendIRC(`JOIN ${newChannel}`);
-
-            botSay(
-                channel,
-                `${newChannel} ditambahkan dan aLw akan join.`
-            );
-
-        } else {
-
-            botSay(
-                channel,
-                `${newChannel} sudah ada di daftar channel.`
-            );
+        if (channels.includes(channel)) {
+            commandReply(target, `${channel} sudah ada.`);
+            return;
         }
+
+        channels.push(channel);
+        saveChannels();
+
+        ircSend(`JOIN ${channel}`);
+
+        commandReply(
+            target,
+            `${channel} berhasil ditambahkan.`
+        );
 
         return;
     }
 
-    /*
-    -chan
-    */
-
-    if (text.startsWith("-chan ")) {
+    if (command === "-chan") {
 
         if (!isOwner(nick)) {
-            botNotice(nick, "Command ini khusus owner.");
+            commandReply(target, "Perintah ini khusus owner.");
             return;
         }
 
-        const oldChannel =
-            text.substring(6).trim();
+        const channel = args[0];
 
-        if (!channels.includes(oldChannel)) {
-
-            botSay(
-                channel,
-                `${oldChannel} tidak ada di daftar.`
-            );
-
+        if (!channel) {
+            commandReply(target, "Gunakan: -chan #channel");
             return;
         }
 
-        channels =
-            channels.filter(
-                c => c.toLowerCase() !== oldChannel.toLowerCase()
+        if (!channels.includes(channel)) {
+            commandReply(
+                target,
+                `${channel} tidak ada dalam daftar.`
             );
+            return;
+        }
+
+        ircSend(`PART ${channel} :Removed by owner`);
+
+        channels = channels.filter(
+            c => c.toLowerCase() !== channel.toLowerCase()
+        );
 
         saveChannels();
 
-        sendIRC(`PART ${oldChannel} :Leaving channel`);
-
-        botSay(
-            channel,
-            `${oldChannel} dihapus dari daftar channel.`
+        commandReply(
+            target,
+            `${channel} berhasil dihapus.`
         );
 
         return;
     }
 
-    /*
-    .chans
-    */
-
-    if (text === ".chans") {
+    if (command === ".chans") {
 
         if (channels.length === 0) {
-
-            botSay(
-                channel,
-                "Belum ada channel."
-            );
-
+            commandReply(target, "Belum ada channel.");
             return;
         }
 
-        botSay(
-            channel,
-            `Channel: ${channels.join(" | ")}`
+        commandReply(
+            target,
+            `Channel: ${channels.join(", ")}`
         );
 
         return;
     }
 
-    /*
-    .rejoin
-    */
-
-    if (text.startsWith(".rejoin ")) {
+    if (command === ".rejoin") {
 
         if (!isOwner(nick)) {
-            botNotice(nick, "Command ini khusus owner.");
+            commandReply(target, "Perintah ini khusus owner.");
             return;
         }
 
-        const target =
-            text.substring(8).trim();
+        const channel = args[0];
 
-        sendIRC(`PART ${target} :Rejoin`);
+        if (!channel) {
+            commandReply(target, "Gunakan: .rejoin #channel");
+            return;
+        }
+
+        ircSend(`PART ${channel} :Rejoin`);
+        
         setTimeout(() => {
-            sendIRC(`JOIN ${target}`);
-        }, 2000);
+            ircSend(`JOIN ${channel}`);
+        }, 1000);
 
         return;
     }
 
-    /*
-    .say
-    */
-
-    if (text.startsWith(".say ")) {
+    if (command === ".say") {
 
         if (!isOwner(nick)) {
-            botNotice(nick, "Command ini khusus owner.");
+            commandReply(target, "Perintah ini khusus owner.");
             return;
         }
 
-        const msg =
-            text.substring(5).trim();
+        const text = message.substring(5).trim();
 
-        botSay(channel, msg);
+        if (!text) {
+            commandReply(target, "Gunakan: .say pesan");
+            return;
+        }
 
+        commandReply(target, text);
         return;
     }
 
-    /*
-    .msg
-    */
-
-    if (text.startsWith(".msg ")) {
+    if (command === ".msg") {
 
         if (!isOwner(nick)) {
-            botNotice(nick, "Command ini khusus owner.");
+            commandReply(target, "Perintah ini khusus owner.");
             return;
         }
 
-        const parts =
-            text.substring(5).trim().split(" ");
+        const dest = args[0];
+        const text = args.slice(1).join(" ");
 
-        const target = parts.shift();
-        const msg = parts.join(" ");
-
-        if (target && msg) {
-
-            sendIRC(
-                `PRIVMSG ${target} :${msg}`
+        if (!dest || !text) {
+            commandReply(
+                target,
+                "Gunakan: .msg nick pesan"
             );
-        }
-
-        return;
-    }
-
-    /*
-    .notice
-    */
-
-    if (text.startsWith(".notice ")) {
-
-        if (!isOwner(nick)) {
-            botNotice(nick, "Command ini khusus owner.");
             return;
         }
 
-        const parts =
-            text.substring(8).trim().split(" ");
-
-        const target = parts.shift();
-        const msg = parts.join(" ");
-
-        if (target && msg) {
-            botNotice(target, msg);
-        }
-
+        ircSend(`PRIVMSG ${dest} :${text}`);
         return;
     }
 
-    /*
-    .kick
-    */
-
-    if (text.startsWith(".kick ")) {
+    if (command === ".notice") {
 
         if (!isOwner(nick)) {
-            botNotice(nick, "Command ini khusus owner.");
+            commandReply(target, "Perintah ini khusus owner.");
             return;
         }
 
-        const parts =
-            text.substring(6).trim().split(" ");
+        const dest = args[0];
+        const text = args.slice(1).join(" ");
 
-        const target = parts.shift();
-        const reason =
-            parts.join(" ") || "Kicked by aLw";
-
-        if (target) {
-
-            sendIRC(
-                `KICK ${channel} ${target} :${reason}`
+        if (!dest || !text) {
+            commandReply(
+                target,
+                "Gunakan: .notice nick pesan"
             );
-        }
-
-        return;
-    }
-
-    /*
-    .ban
-    */
-
-    if (text.startsWith(".ban ")) {
-
-        if (!isOwner(nick)) {
-            botNotice(nick, "Command ini khusus owner.");
             return;
         }
 
-        const target =
-            text.substring(5).trim();
-
-        if (target) {
-
-            sendIRC(
-                `MODE ${channel} +b ${target}`
-            );
-
-            sendIRC(
-                `KICK ${channel} ${target} :Banned by aLw`
-            );
-        }
-
+        ircSend(`NOTICE ${dest} :${text}`);
         return;
     }
 
-    /*
-    .unban
-    */
-
-    if (text.startsWith(".unban ")) {
+    if (command === ".kick") {
 
         if (!isOwner(nick)) {
-            botNotice(nick, "Command ini khusus owner.");
+            commandReply(target, "Perintah ini khusus owner.");
             return;
         }
 
-        const target =
-            text.substring(7).trim();
+        const user = args[0];
 
-        if (target) {
-
-            sendIRC(
-                `MODE ${channel} -b ${target}`
-            );
-        }
-
-        return;
-    }
-
-    /*
-    .op
-    */
-
-    if (text.startsWith(".op ")) {
-
-        if (!isOwner(nick)) {
-            botNotice(nick, "Command ini khusus owner.");
+        if (!user) {
+            commandReply(target, "Gunakan: .kick nick");
             return;
         }
 
-        const target =
-            text.substring(4).trim();
-
-        if (target) {
-            sendIRC(
-                `MODE ${channel} +o ${target}`
-            );
-        }
-
-        return;
-    }
-
-    /*
-    .deop
-    */
-
-    if (text.startsWith(".deop ")) {
-
-        if (!isOwner(nick)) {
-            botNotice(nick, "Command ini khusus owner.");
-            return;
-        }
-
-        const target =
-            text.substring(6).trim();
-
-        if (target) {
-            sendIRC(
-                `MODE ${channel} -o ${target}`
-            );
-        }
-
-        return;
-    }
-
-    /*
-    .voice
-    */
-
-    if (text.startsWith(".voice ")) {
-
-        if (!isOwner(nick)) {
-            botNotice(nick, "Command ini khusus owner.");
-            return;
-        }
-
-        const target =
-            text.substring(7).trim();
-
-        if (target) {
-            sendIRC(
-                `MODE ${channel} +v ${target}`
-            );
-        }
-
-        return;
-    }
-
-    /*
-    .devoice
-    */
-
-    if (text.startsWith(".devoice ")) {
-
-        if (!isOwner(nick)) {
-            botNotice(nick, "Command ini khusus owner.");
-            return;
-        }
-
-        const target =
-            text.substring(9).trim();
-
-        if (target) {
-            sendIRC(
-                `MODE ${channel} -v ${target}`
-            );
-        }
-
-        return;
-    }
-
-    /*
-    .topic
-    */
-
-    if (text.startsWith(".topic ")) {
-
-        if (!isOwner(nick)) {
-            botNotice(nick, "Command ini khusus owner.");
-            return;
-        }
-
-        const topic =
-            text.substring(7).trim();
-
-        sendIRC(
-            `TOPIC ${channel} :${topic}`
+        ircSend(
+            `KICK ${target} ${user} :Kicked by aLwsc`
         );
 
         return;
     }
 
-    /*
-    .invite
-    */
-
-    if (text.startsWith(".invite ")) {
+    if (command === ".ban") {
 
         if (!isOwner(nick)) {
-            botNotice(nick, "Command ini khusus owner.");
+            commandReply(target, "Perintah ini khusus owner.");
             return;
         }
 
-        const target =
-            text.substring(8).trim();
+        const user = args[0];
 
-        if (target) {
-
-            sendIRC(
-                `INVITE ${target} ${channel}`
-            );
-        }
-
-        return;
-    }
-
-    /*
-    .mode
-    */
-
-    if (text.startsWith(".mode ")) {
-
-        if (!isOwner(nick)) {
-            botNotice(nick, "Command ini khusus owner.");
+        if (!user) {
+            commandReply(target, "Gunakan: .ban nick");
             return;
         }
 
-        const mode =
-            text.substring(6).trim();
-
-        if (mode) {
-
-            sendIRC(
-                `MODE ${channel} ${mode}`
-            );
-        }
-
+        ircSend(`MODE ${target} +b ${user}`);
         return;
     }
 
-    /*
-    .status
-    */
+    if (command === ".unban") {
 
-    if (text === ".status") {
+        if (!isOwner(nick)) {
+            commandReply(target, "Perintah ini khusus owner.");
+            return;
+        }
 
-        botSay(
-            channel,
-            `aLw: ${ircConnected ? "ONLINE" : "OFFLINE"} | Channels: ${channels.length}`
+        const mask = args[0];
+
+        if (!mask) {
+            commandReply(target, "Gunakan: .unban mask");
+            return;
+        }
+
+        ircSend(`MODE ${target} -b ${mask}`);
+        return;
+    }
+
+    if (command === ".op") {
+
+        if (!isOwner(nick)) {
+            commandReply(target, "Perintah ini khusus owner.");
+            return;
+        }
+
+        const user = args[0];
+
+        if (!user) {
+            commandReply(target, "Gunakan: .op nick");
+            return;
+        }
+
+        ircSend(`MODE ${target} +o ${user}`);
+        return;
+    }
+
+    if (command === ".deop") {
+
+        if (!isOwner(nick)) {
+            commandReply(target, "Perintah ini khusus owner.");
+            return;
+        }
+
+        const user = args[0];
+
+        if (!user) {
+            commandReply(target, "Gunakan: .deop nick");
+            return;
+        }
+
+        ircSend(`MODE ${target} -o ${user}`);
+        return;
+    }
+
+    if (command === ".voice") {
+
+        if (!isOwner(nick)) {
+            commandReply(target, "Perintah ini khusus owner.");
+            return;
+        }
+
+        const user = args[0];
+
+        if (!user) {
+            commandReply(target, "Gunakan: .voice nick");
+            return;
+        }
+
+        ircSend(`MODE ${target} +v ${user}`);
+        return;
+    }
+
+    if (command === ".devoice") {
+
+        if (!isOwner(nick)) {
+            commandReply(target, "Perintah ini khusus owner.");
+            return;
+        }
+
+        const user = args[0];
+
+        if (!user) {
+            commandReply(target, "Gunakan: .devoice nick");
+            return;
+        }
+
+        ircSend(`MODE ${target} -v ${user}`);
+        return;
+    }
+
+    if (command === ".topic") {
+
+        if (!isOwner(nick)) {
+            commandReply(target, "Perintah ini khusus owner.");
+            return;
+        }
+
+        const topic = message.substring(6).trim();
+
+        if (!topic) {
+            commandReply(target, "Gunakan: .topic teks");
+            return;
+        }
+
+        ircSend(`TOPIC ${target} :${topic}`);
+        return;
+    }
+
+    if (command === ".invite") {
+
+        if (!isOwner(nick)) {
+            commandReply(target, "Perintah ini khusus owner.");
+            return;
+        }
+
+        const user = args[0];
+
+        if (!user) {
+            commandReply(target, "Gunakan: .invite nick");
+            return;
+        }
+
+        ircSend(`INVITE ${user} ${target}`);
+        return;
+    }
+
+    if (command === ".mode") {
+
+        if (!isOwner(nick)) {
+            commandReply(target, "Perintah ini khusus owner.");
+            return;
+        }
+
+        const mode = args.join(" ");
+
+        if (!mode) {
+            commandReply(target, "Gunakan: .mode +nt");
+            return;
+        }
+
+        ircSend(`MODE ${target} ${mode}`);
+        return;
+    }
+
+    if (command === ".status") {
+
+        commandReply(
+            target,
+            `aLw IRC: ${connected ? "ONLINE" : "OFFLINE"} | Channels: ${channels.length}`
         );
 
         return;
     }
 
-    /*
-    .ping
-    */
+    if (command === ".ping") {
 
-    if (text === ".ping") {
-
-        botSay(
-            channel,
-            "PONG 🏓"
-        );
-
+        commandReply(target, "PONG!");
         return;
     }
 
-    /*
-    .uptime
-    */
+    if (command === ".uptime") {
 
-    if (text === ".uptime") {
+        const seconds = Math.floor(process.uptime());
 
-        const seconds =
-            Math.floor(process.uptime());
+        const hours = Math.floor(seconds / 3600);
+        const minutes = Math.floor(
+            (seconds % 3600) / 60
+        );
+        const secs = seconds % 60;
 
-        const hours =
-            Math.floor(seconds / 3600);
-
-        const minutes =
-            Math.floor((seconds % 3600) / 60);
-
-        const secs =
-            seconds % 60;
-
-        botSay(
-            channel,
+        commandReply(
+            target,
             `Uptime: ${hours}j ${minutes}m ${secs}d`
         );
 
         return;
     }
 
-    /*
-    .help
-    */
+    if (command === ".help") {
 
-    if (text === ".help") {
-
-        botSay(
-            channel,
-            "Command: +chan #chan | -chan #chan | .chans | .rejoin #chan | .say teks | .msg nick teks | .notice nick teks | .kick nick | .ban nick | .unban nick | .op nick | .deop nick | .voice nick | .devoice nick | .topic teks | .invite nick | .mode mode | .status | .ping | .uptime"
+        commandReply(
+            target,
+            "aLw: +chan -chan .chans .rejoin .say .msg .notice .kick .ban .unban .op .deop .voice .devoice .topic .invite .mode .status .ping .uptime"
         );
 
         return;
     }
 }
 
-/*
-============================================================
-WEBCHAT COMMAND
-============================================================
-*/
+/* ============================================================
+   WEBCHAT
+   ============================================================ */
 
-function handleWebCommand(nick, message, ws) {
+function broadcastWebChat(data) {
 
-    const text = message.substring(1).trim();
+    const payload = JSON.stringify(data);
 
-    if (!text) {
-        return;
+    for (const client of wss.clients) {
+
+        if (client.readyState === 1) {
+            client.send(payload);
+        }
     }
-
-    /*
-     * WebChat user tidak dianggap sebagai IRC owner.
-     * Command administrasi hanya bisa dijalankan
-     * setelah nick IRC owner F4R1S.
-     */
-
-    if (text === "status") {
-
-        ws.send(JSON.stringify({
-            type: "system",
-            message: `DALnet: ${ircConnected ? "ONLINE" : "OFFLINE"} | Channel: ${channels.length}`
-        }));
-
-        return;
-    }
-
-    if (text === "help") {
-
-        ws.send(JSON.stringify({
-            type: "system",
-            message: "/status untuk melihat status | Chat biasa dikirim ke channel IRC."
-        }));
-
-        return;
-    }
-
-    ws.send(JSON.stringify({
-        type: "system",
-        message: "Command WebChat tidak tersedia atau membutuhkan owner IRC."
-    }));
 }
 
-/*
-============================================================
-JOIN SAVED CHANNELS
-============================================================
-*/
+wss.on("connection", (ws) => {
 
-function joinSavedChannels() {
+    const webNick =
+        "WebUser" +
+        Math.floor(1000 + Math.random() * 9000);
 
-    if (!ircRegistered) {
-        return;
-    }
+    ws.webNick = webNick;
 
-    for (const channel of channels) {
+    ws.send(
+        JSON.stringify({
+            type: "system",
+            message:
+                `Selamat datang ${webNick} di aLw WebChat.`
+        })
+    );
 
-        setTimeout(() => {
+    ws.on("message", (raw) => {
 
-            console.log("JOIN", channel);
+        try {
 
-            sendIRC(
-                `JOIN ${channel}`
+            const data = JSON.parse(
+                raw.toString()
             );
 
-        }, 1000);
-    }
-}
+            if (data.type === "nick") {
 
-/*
-============================================================
-START SERVER
-============================================================
-*/
+                if (
+                    typeof data.nick === "string" &&
+                    data.nick.trim()
+                ) {
 
-server.listen(
-    PORT,
-    "0.0.0.0",
-    () => {
+                    ws.webNick =
+                        data.nick
+                            .trim()
+                            .substring(0, 20);
 
-        console.log(
-            `aLw WebChat berjalan di port ${PORT}`
-        );
+                    ws.send(
+                        JSON.stringify({
+                            type: "system",
+                            message:
+                                `Nick diubah menjadi ${ws.webNick}.`
+                        })
+                    );
+                }
 
-        console.log(
-            `aLw IRC Bot target: ${IRC_HOST}:${IRC_PORT}`
-        );
+                return;
+            }
 
-        connectIRC();
-    }
-);
+            if (data.type === "message") {
+
+                const message =
+                    String(data.message || "").trim();
+
+                if (!message) {
+                    return;
+                }
+
+                const channel = firstChannel();
+
+                if (!channel) {
+
+                    ws.send(
+                        JSON.stringify({
+                            type: "system",
+                            message:
+                                "Belum ada channel IRC yang ditambahkan."
+                        })
+                    );
+
+                    return;
+                }
+
+                ircSend(
+                    `PRIVMSG ${channel} :[Web] <${ws.webNick}> ${message}`
+                );
+
+                broadcastWebChat({
+                    type: "web",
+                    nick: ws.webNick,
+                    channel: channel,
+                    message: message
+                });
+            }
+
+        } catch (err) {
+
+            console.log(
+                "WebSocket error:",
+                err.message
+            );
+        }
+    });
+});
+
+/* ============================================================
+   START
+   ============================================================ */
+
+server.listen(PORT, "0.0.0.0", () => {
+
+    console.log(
+        `aLw WebChat berjalan di port ${PORT}`
+    );
+
+    console.log(
+        `aLw IRC Bot target: ${IRC_HOST}:${IRC_PORT}`
+    );
+
+    connectIRC();
+});
