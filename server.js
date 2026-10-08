@@ -51,7 +51,7 @@ function sayChunked(target, prefix, items) {
   let line = prefix;
 
   for (const it of items) {
-    const add = (line === prefix) ? it : ` ${it}`;
+    const add = (line === prefix) ? it : " " + it;
 
     if ((line + add).length > max) {
       say(target, line);
